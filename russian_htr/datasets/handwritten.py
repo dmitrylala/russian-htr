@@ -1,7 +1,7 @@
-import json
-from pathlib import Path
+import pickle
 from typing import Optional, Union
 
+import numpy as np
 from albumentations import BasicTransform
 from albumentations.core.composition import BaseCompose
 
@@ -12,53 +12,67 @@ from torchok.constructor import DATASETS
 
 @DATASETS.register_class
 class HandwrittenDataset(ImageDataset):
-    data_modes = ['all', 'train', 'val', 'test']
+    data_modes = ['train', 'test']
 
     def __init__(
         self,
-        data_folder: str,
+        ds_pickle: str,
         mode: str,
         transform: Union[BasicTransform, BaseCompose],
         augment: Optional[Union[BasicTransform, BaseCompose]] = None,
         input_dtype: str = 'float32'
     ):
         """
-        Dataset with pairs (image, text).
+        Dataset class for loading IAM or CVL dataset in .pickle with following format:
+
+        {
+        'train': [{writer_1:[{'img': <PIL.IMAGE>, 'label':<str_label>},...]},
+                    {writer_2:[{'img': <PIL.IMAGE>, 'label':<str_label>},...]},...],
+        'test': [{writer_3:[{'img': <PIL.IMAGE>, 'label':<str_label>},...]},
+                    {writer_4:[{'img': <PIL.IMAGE>, 'label':<str_label>},...]},...],
+        }
+
+        Pairs (image, text) should be divided by writers.
+
         Args:
-            data_folder: Directory with subfolders 'images' and 'labels',
-                        also with .json's with markup.
-            mode: 'train', 'val' or 'test'
+            ds_pickle: Path to .pickle file with python dict in described format.
+            mode: 'train' or 'test'.
             transform: Transform to be applied on a sample. This should have the
                 interface of transforms in `albumentations` library.
             augment: Optional augment to be applied on a sample.
                 This should have the interface of transforms in `albumentations` library.
             input_dtype: Type of output image tensor.
-        Raises:
-            RuntimeError: if dataset or metadata file not found or corrupted.
         """
         super().__init__(transform=transform, augment=augment, input_dtype=input_dtype)
 
         if mode not in self.data_modes:
             raise ValueError(f"Mode {mode} is invalid")
-        self.mode = mode
 
-        data_folder = Path(data_folder)
-        with open(data_folder / f"{mode}.json") as f:
-            markup = json.load(f)
+        with open(ds_pickle, 'rb') as f:
+            ds = pickle.load(f)[mode]
 
-        self.images = sorted(map(lambda x: str(data_folder / 'images' / x), markup.keys()))
+        samples = []
+        writer2idxs = {}
+        for writer_id, writer_samples in ds.items():
+            start_idx = len(samples)
+            idxs = np.arange(start_idx, start_idx + len(writer_samples))
+            writer2idxs[writer_id] = idxs
 
-        if mode != 'test':
-            label_paths = sorted(map(lambda x: str(data_folder / 'labels' / x), markup.values()))
-            self.labels = []
-            for label_path in label_paths:
-                with open(label_path) as f:
-                    label = json.load(f)
-                self.labels.append(label)
+            samples.extend(writer_samples)
+
+        # renaming keys
+        for sample in samples:
+            sample['image'] = sample.pop('img')
+            sample['target'] = sample.pop('label')
+        self.samples = samples
+
+        # attribute for GroupSampler:
+        # batches need to contain samples from only one writer
+        self.group2idxs = writer2idxs
 
     def __len__(self) -> int:
         """Dataset length."""
-        return len(self.images)
+        return len(self.samples)
 
     def get_raw(self, idx: int) -> dict:
         """
@@ -69,10 +83,9 @@ class HandwrittenDataset(ImageDataset):
             sample['target'] - Text on image.
             sample['index'] - Index.
         """
-        image = self._read_image(self.images[idx])
-        sample = {"image": image, 'index': idx}
-        if self.mode != 'test':
-            sample['target'] = self.labels[idx]
+        sample = self.samples[idx]
+        sample['image'] = np.array(sample['image'])
+        sample['index'] = idx
 
         sample = self._apply_transform(self.augment, sample)
 

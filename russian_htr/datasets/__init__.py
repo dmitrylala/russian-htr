@@ -1,1 +1,1 @@
-from .handwritten_text import HandwrittenDataset
+from .handwritten import HandwrittenDataset

@@ -1,0 +1,52 @@
+task:
+  name: TextToImageTask
+
+  # task params (excluding inputs)
+  params:
+    backbone_name: resnet34
+    backbone_params:
+      pretrained: true
+      in_channels: 3
+    pooling_name: Pooling
+    head_name: ClassificationHead
+    head_params:
+      num_classes: &num_classes 42
+
+    inputs:
+      - shape: [3, &height 32, &width 192]
+        dtype: &input_dtype float32
+  seed_params:
+    seed: 42
+    workers: true
+
+
+data:
+  TRAIN:
+    - dataloader:
+        batch_size: 2
+        num_workers: 2
+        drop_last: true
+      dataset:
+        name: HandwrittenDataset
+        params:
+          ds_pickle: &ds_pickle ${oc.env:HOME}/russian-htr/data/IAM-32.pickle
+          mode: train
+          input_dtype: *input_dtype
+
+        transform:
+          - &pad
+            name: PadIfNeeded
+            params:
+              min_height: *height
+              min_width: *width
+              border_mode: 0
+              value: 0
+          - &crop
+            name: Crop
+            params:
+              y_max: *height
+              x_max: *width
+          - &normalize
+            name: Normalize
+          - &totensor
+            name: ToTensorV2
