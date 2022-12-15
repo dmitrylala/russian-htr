@@ -48,5 +48,8 @@ data:
               x_max: *width
           - &normalize
             name: Normalize
+            params:
+              mean: [ 0.5 ]
+              std: [ 0.5 ]
           - &totensor
             name: ToTensorV2

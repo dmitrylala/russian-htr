@@ -1,40 +1,70 @@
+import numpy as np
+
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+from torchok.losses import CTCLoss
+
+from .generator import Generator
+from .gans import WriterDiscriminator, Discriminator
+from .string_encoder import StringEncoder
+from .crnn import CRNN
+from .vocab import VOCABULARY
+
+
+IMG_HEIGHT = 32
+NUM_WORDS = 3
+
+# Hinge Loss
+def loss_hinge_dis(dis_fake, dis_real, len_text_fake, len_text, mask_loss):
+    mask_real = torch.ones(dis_real.shape).to(dis_real.device)
+    mask_fake = torch.ones(dis_fake.shape).to(dis_fake.device)
+    if mask_loss and len(dis_fake.shape)>2:
+        for i in range(len(len_text)):
+            mask_real[i, :, :, len_text[i]:] = 0
+            mask_fake[i, :, :, len_text_fake[i]:] = 0
+    loss_real = torch.sum(F.relu(1. - dis_real * mask_real))/torch.sum(mask_real)
+    loss_fake = torch.sum(F.relu(1. + dis_fake * mask_fake))/torch.sum(mask_fake)
+    return loss_real, loss_fake
+
+
+def loss_hinge_gen(dis_fake, len_text_fake, mask_loss):
+    mask_fake = torch.ones(dis_fake.shape).to(dis_fake.device)
+    if mask_loss and len(dis_fake.shape)>2:
+        for i in range(len(len_text_fake)):
+            mask_fake[i, :, :, len_text_fake[i]:] = 0
+    loss = -torch.sum(dis_fake * mask_fake) / torch.sum(mask_fake)
+    return loss
 
 
 class TRGAN(nn.Module):
-    def __init__(self):
+    def __init__(self, gen_params, device, g_lr, ocr_lr, d_lr, w_lr, batch_size, output_dim, resolution: int = 16):
         super().__init__()
 
-
         self.epsilon = 1e-7
-        self.netG = Generator().to(DEVICE)
-        self.netD = nn.DataParallel(Discriminator()).to(DEVICE)
-        self.netW = nn.DataParallel(WDiscriminator()).to(DEVICE)
-        self.netconverter = strLabelConverter(ALPHABET)
-        self.netOCR = CRNN().to(DEVICE)
+        self.resolution = resolution
+        self.batch_size = batch_size
+        self.device = device
+        self.netG = Generator(**gen_params).to(device)
+
+        # removed nn.DataParallel from here
+        self.netD = Discriminator().to(device)
+        self.netW = WriterDiscriminator(output_dim).to(device)
+
+        self.netconverter = StringEncoder(VOCABULARY)
+        self.netOCR = CRNN(len(VOCABULARY), gen_params['hidden_dim']).to(device)
         self.OCR_criterion = CTCLoss(zero_infinity=True, reduction='none')
 
-        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
-        self.inception = InceptionV3([block_idx]).to(DEVICE)
+        self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=g_lr, betas=(0.0, 0.999))
+        self.optimizer_OCR = torch.optim.Adam(self.netOCR.parameters(), lr=ocr_lr, betas=(0.0, 0.999))
 
+        self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=d_lr, betas=(0.0, 0.999))
 
-        self.optimizer_G = torch.optim.Adam(self.netG.parameters(),
-                                                lr=G_LR, betas=(0.0, 0.999), weight_decay=0, eps=1e-8)
-        self.optimizer_OCR = torch.optim.Adam(self.netOCR.parameters(),
-                                                lr=OCR_LR, betas=(0.0, 0.999), weight_decay=0,
-                                                eps=1e-8)
-
-        self.optimizer_D = torch.optim.Adam(self.netD.parameters(),
-                                                lr=D_LR, betas=(0.0, 0.999), weight_decay=0, eps=1e-8)
-
-
-        self.optimizer_wl = torch.optim.Adam(self.netW.parameters(),
-                                                lr=W_LR, betas=(0.0, 0.999), weight_decay=0, eps=1e-8)
+        self.optimizer_wl = torch.optim.Adam(self.netW.parameters(), lr=w_lr, betas=(0.0, 0.999))
 
 
         self.optimizers = [self.optimizer_G, self.optimizer_OCR, self.optimizer_D, self.optimizer_wl]
-
 
         self.optimizer_G.zero_grad()
         self.optimizer_OCR.zero_grad()
@@ -56,111 +86,59 @@ class TRGAN(nn.Module):
         self.KLD = 0
 
 
-        with open(ENGLISH_WORDS_PATH, 'rb') as f:
-            self.lex = f.read().splitlines()
-        lex=[]
-        for word in self.lex:
-            try:
-                word=word.decode("utf-8")
-            except:
-                continue
-            if len(word)<20:
-                lex.append(word)
-        self.lex = lex
+        with open("/home/d.nesterov/russian-htr/data/query_words_eng.txt") as f:
+            words = f.read().splitlines()
+            self.lex = list(filter(lambda x: len(x) < 20, words))
+        # lex = []
+        # for word in self.lex:
+        #     try:
+        #         word = word.decode("utf-8")
+        #     except:
+        #         continue
+        #     if len(word) < 20:
+        #         lex.append(word)
+        # self.lex = lex
 
+        sample = 'Hello, this is sample text to reproduce'
 
-        f = open('mytext.txt', 'r')
-
-        self.text = [j.encode() for j in sum([i.split(' ') for i in f.readlines()], [])]#[:NUM_EXAMPLES]
+        self.text = [j for j in sample.split()]
         self.eval_text_encode, self.eval_len_text = self.netconverter.encode(self.text)
-        self.eval_text_encode = self.eval_text_encode.to(DEVICE).repeat(batch_size, 1, 1)
+        self.eval_text_encode = self.eval_text_encode.to(device).repeat(batch_size, 1, 1).flatten(1, 2)
 
-    def save_images_for_fid_calculation(self, dataloader, epoch, mode = 'train'):
-
-        self.real_base = os.path.join('saved_images', EXP_NAME, 'Real')
-        self.fake_base = os.path.join('saved_images', EXP_NAME, 'Fake')
-
-        if os.path.isdir(self.real_base): shutil.rmtree(self.real_base)
-        if os.path.isdir(self.fake_base): shutil.rmtree(self.fake_base)
-
-        os.mkdir(self.real_base)
-        os.mkdir(self.fake_base)
-
-        for step,data in enumerate(dataloader):
-
-            ST = data['simg'].cuda()
-            self.fakes = self.netG.Eval(ST, self.eval_text_encode)
-            fake_images = torch.cat(self.fakes, 1).detach().cpu().numpy()
-
-            for i in range(fake_images.shape[0]):
-                for j in range(fake_images.shape[1]):
-                    #cv2.imwrite(os.path.join(self.real_base, str(step*batch_size + i)+'_'+str(j)+'.png'), 255*(real_images[i,j]))
-                    cv2.imwrite(os.path.join(self.fake_base, str(step*batch_size + i)+'_'+str(j)+'.png'), 255*(fake_images[i,j]))
-
-
-        if mode == 'train':
-
-            TextDatasetObj = TextDataset(num_examples = self.eval_text_encode.shape[1])
-            dataset_real = torch.utils.data.DataLoader(
-                        TextDatasetObj,
-                        batch_size=batch_size,
-                        shuffle=True,
-                        num_workers=0,
-                        pin_memory=True, drop_last=True,
-                        collate_fn=TextDatasetObj.collate_fn)
-
-        elif mode == 'test':
-
-            TextDatasetObjval = TextDatasetval(num_examples = self.eval_text_encode.shape[1])
-            dataset_real = torch.utils.data.DataLoader(
-                        TextDatasetObjval,
-                        batch_size=batch_size,
-                        shuffle=True,
-                        num_workers=0,
-                        pin_memory=True, drop_last=True,
-                        collate_fn=TextDatasetObjval.collate_fn)
-
-        for step,data in enumerate(dataset_real):
-
-            real_images = data['simg'].numpy()
-
-            for i in range(real_images.shape[0]):
-                for j in range(real_images.shape[1]):
-                    cv2.imwrite(os.path.join(self.real_base, str(step*batch_size + i)+'_'+str(j)+'.png'), 255*(real_images[i,j]))
-
-
-        return self.real_base, self.fake_base
-
+    @torch.no_grad()
     def _generate_page(self, ST, SLEN, eval_text_encode = None, eval_len_text = None):
-
         if eval_text_encode == None:
             eval_text_encode = self.eval_text_encode
         if eval_len_text == None:
             eval_len_text = self.eval_len_text
 
+        words = [word for word in np.random.choice(self.lex, self.batch_size, replace=False)]
+        text_encode_fake, len_text_fake = self.netconverter.encode(words)
+        text_encode_fake = text_encode_fake.to(self.device).repeat(self.batch_size, 1, 1).flatten(1, 2)
 
-        self.fakes = self.netG.Eval(ST, eval_text_encode)
+        # print(ST.shape, text_encode_fake.shape)
+        # self.fakes = self.netG.forward_queries(ST, eval_text_encode)
+        self.fakes = self.netG(ST, text_encode_fake).detach()
+        # print(self.fakes.shape)
 
         page1s = []
         page2s = []
-
-        for batch_idx in range(batch_size):
-
+        for batch_idx in range(self.batch_size):
             word_t = []
             word_l = []
 
-            gap = np.ones([IMG_HEIGHT,16])
+            gap = np.ones([IMG_HEIGHT, 16])  # IMG_HEIGHT = 32
 
             line_wids = []
 
             for idx, fake_ in enumerate(self.fakes):
 
-                word_t.append((fake_[batch_idx,0,:,:eval_len_text[idx]*resolution].cpu().numpy()+1)/2)
-
-                word_t.append(gap)
+                word_t.append((fake_[0,:len_text_fake[idx] * self.resolution].cpu().numpy() + 1)/2)
+                word_t.append(gap.copy())
 
                 if len(word_t) == 16 or idx == len(self.fakes) - 1:
-
+                    # shapes = [a.shape for a in word_t]
+                    # print(f"SHAPES ONE: {shapes}")
                     line_ = np.concatenate(word_t, -1)
 
                     word_l.append(line_)
@@ -168,8 +146,7 @@ class TRGAN(nn.Module):
 
                     word_t = []
 
-
-            gap_h = np.ones([16,max(line_wids)])
+            gap_h = np.ones([16, max(line_wids)])
 
             page_= []
 
@@ -180,15 +157,15 @@ class TRGAN(nn.Module):
                 page_.append(np.concatenate([l, pad_], 1))
                 page_.append(gap_h)
 
-
-
+            # for a in page_:
+            #     print(a.shape)
             page1 = np.concatenate(page_, 0)
 
 
             word_t = []
             word_l = []
 
-            gap = np.ones([IMG_HEIGHT,16])
+            gap = np.ones([IMG_HEIGHT, 16])
 
             line_wids = []
 
@@ -196,12 +173,16 @@ class TRGAN(nn.Module):
 
             for idx, st in enumerate((sdata_)):
 
-                word_t.append((st[batch_idx,0,:,:int(SLEN.cpu().numpy()[batch_idx][idx])].cpu().numpy()+1)/2)
-
-                word_t.append(gap)
+                # print(SLEN.shape, SLEN)
+                word_t.append((st[idx, 0,:,:int(SLEN.cpu().numpy()[batch_idx])].squeeze().cpu().numpy()+1)/2)
+                if word_t[-1].shape[0] == 16:
+                    print(word_t[-1].shape, st.shape)
+                word_t.append(gap.copy())
+                # print(word_t[-1].shape)
 
                 if len(word_t) == 16 or idx == len(sdata_) - 1:
-
+                    # shapes = [a.shape for a in word_t]
+                    # print(f"SHAPES TWO: {shapes}")
                     line_ = np.concatenate(word_t, -1)
 
                     word_l.append(line_)
@@ -210,7 +191,7 @@ class TRGAN(nn.Module):
                     word_t = []
 
 
-            gap_h = np.ones([16,max(line_wids)])
+            gap_h = np.ones([16, max(line_wids)])
 
             page_= []
 
@@ -221,24 +202,18 @@ class TRGAN(nn.Module):
                 page_.append(np.concatenate([l, pad_], 1))
                 page_.append(gap_h)
 
-
-
             page2 = np.concatenate(page_, 0)
 
             merge_w_size =  max(page1.shape[0], page2.shape[0])
 
             if page1.shape[0] != merge_w_size:
-
                 page1 = np.concatenate([page1, np.ones([merge_w_size-page1.shape[0], page1.shape[1]])], 0)
 
             if page2.shape[0] != merge_w_size:
-
                 page2 = np.concatenate([page2, np.ones([merge_w_size-page2.shape[0], page2.shape[1]])], 0)
-
 
             page1s.append(page1)
             page2s.append(page2)
-
 
             #page = np.concatenate([page2, page1], 1)
 
@@ -246,19 +221,12 @@ class TRGAN(nn.Module):
         max_wid = max([i.shape[1] for i in page2s])
         padded_page2s = []
 
-        for para in page2s:
-            padded_page2s.append(np.concatenate([para, np.ones([ para.shape[0], max_wid-para.shape[1]])], 1))
+        for pair in page2s:
+            padded_page2s.append(np.concatenate([pair, np.ones([ pair.shape[0], max_wid-pair.shape[1]])], 1))
 
         padded_page2s_ =  np.concatenate(padded_page2s,0)
 
-
-
-
         return np.concatenate([padded_page2s_, page1s_], 1)
-
-
-
-
 
     def get_current_losses(self):
 
@@ -280,16 +248,6 @@ class TRGAN(nn.Module):
 
         return losses
 
-
-
-
-    def load_networks(self, epoch):
-        BaseModel.load_networks(self, epoch)
-        if self.opt.single_writer:
-            load_filename = '%s_z.pkl' % (epoch)
-            load_path = os.path.join(self.save_dir, load_filename)
-            self.z = torch.load(load_path)
-
     def _set_input(self, input):
         self.input = input
 
@@ -307,48 +265,48 @@ class TRGAN(nn.Module):
                     param.requires_grad = requires_grad
 
     def forward(self):
+        self.real = self.input['image_orig'].to(self.device)
+        self.label = self.input['target']
+        self.sdata = self.input['image'].to(self.device)
+        self.ST_LEN = self.input['width']
+        self.wcl = self.input['writer_id'].squeeze().to(self.device)
 
-
-        self.real = self.input['img'].to(DEVICE)
-        self.label = self.input['label']
-        self.sdata = self.input['simg'].to(DEVICE)
-        self.ST_LEN = self.input['swids']
         self.text_encode, self.len_text = self.netconverter.encode(self.label)
-        self.one_hot_real = make_one_hot(self.text_encode, self.len_text, VOCAB_SIZE).to(DEVICE).detach()
-        self.text_encode = self.text_encode.to(DEVICE).detach()
+        self.text_encode = self.text_encode.to(self.device).detach()
         self.len_text = self.len_text.detach()
 
-        self.words = [word.encode('utf-8') for word in np.random.choice(self.lex, batch_size)]
+        self.words = [word for word in np.random.choice(self.lex, self.batch_size, replace=False)]
         self.text_encode_fake, self.len_text_fake = self.netconverter.encode(self.words)
-        self.text_encode_fake = self.text_encode_fake.to(DEVICE)
-        self.one_hot_fake = make_one_hot(self.text_encode_fake, self.len_text_fake, VOCAB_SIZE).to(DEVICE)
+        self.text_encode_fake = self.text_encode_fake.to(self.device).repeat(self.batch_size, 1, 1).flatten(1, 2)
 
-        self.text_encode_fake_js = []
+        # self.text_encode_fake_js = []
 
-        for _ in range(NUM_WORDS - 1):
+        # for _ in range(NUM_WORDS - 1):
+        #     self.words_j = [word for word in np.random.choice(self.lex, self.batch_size, replace=False)]
+        #     self.text_encode_fake_j, self.len_text_fake_j = self.netconverter.encode(self.words_j)
+        #     self.text_encode_fake_j = self.text_encode_fake_j.to(self.device)
+        #     self.text_encode_fake_js.append(self.text_encode_fake_j)
 
-            self.words_j = [word.encode('utf-8') for word in np.random.choice(self.lex, batch_size)]
-            self.text_encode_fake_j, self.len_text_fake_j = self.netconverter.encode(self.words_j)
-            self.text_encode_fake_j = self.text_encode_fake_j.to(DEVICE)
-            self.text_encode_fake_js.append(self.text_encode_fake_j)
-
-
-        self.fake = self.netG(self.sdata, self.text_encode_fake, self.text_encode_fake_js)
-
+        # self.fake = self.netG(self.sdata, self.text_encode_fake, self.text_encode_fake_js)
+        print(self.sdata.shape, self.text_encode_fake.shape)
+        self.fake = self.netG(self.sdata, self.text_encode_fake)
 
     def backward_D_OCR(self):
-
+        # print(f"REAL IN backward_D_OC: {self.real.shape}, {self.fake.shape}")
         pred_real = self.netD(self.real.detach())
 
+        # print("FAKE IN backward_D_OCR")
         pred_fake = self.netD(**{'x': self.fake.detach()})
-
 
         self.loss_Dreal, self.loss_Dfake = loss_hinge_dis(pred_fake, pred_real, self.len_text_fake.detach(), self.len_text.detach(), True)
 
         self.loss_D = self.loss_Dreal + self.loss_Dfake
 
         self.pred_real_OCR = self.netOCR(self.real.detach())
-        preds_size = torch.IntTensor([self.pred_real_OCR.size(0)] * batch_size).detach()
+        preds_size = torch.IntTensor([self.pred_real_OCR.size(0)] * self.batch_size).detach()
+
+        # print(self.pred_real_OCR.shape, self.text_encode.detach().shape, preds_size)
+
         loss_OCR_real = self.OCR_criterion(self.pred_real_OCR, self.text_encode.detach(), preds_size, self.len_text.detach())
         self.loss_OCR_real = torch.mean(loss_OCR_real[~torch.isnan(loss_OCR_real)])
 
@@ -360,9 +318,8 @@ class TRGAN(nn.Module):
             param.grad[torch.isnan(param.grad)]=0
             param.grad[torch.isinf(param.grad)]=0
 
-
-
         return loss_total
+
 
     def backward_D_WL(self):
         # Real
@@ -376,7 +333,7 @@ class TRGAN(nn.Module):
         self.loss_D = self.loss_Dreal + self.loss_Dfake
 
 
-        self.loss_w_real = self.netW(self.real.detach(), self.input['wcl'].to(DEVICE)).mean()
+        self.loss_w_real = self.netW(self.real.detach(), self.wcl).mean()
         # total loss
         loss_total = self.loss_D + self.loss_w_real
 
@@ -398,26 +355,25 @@ class TRGAN(nn.Module):
         self.backward_D_WL()
 
 
-
-
     def backward_D_OCR_WL(self):
         # Real
-        if self.real_z_mean is None:
-            pred_real = self.netD(self.real.detach())
-        else:
-            pred_real = self.netD(**{'x': self.real.detach(), 'z': self.real_z_mean.detach()})
+        # print(f"REAL in backward_D_OCR_WL")
+        pred_real = self.netD(**{'x': self.real.detach(), 'z': self.real_z_mean.detach()})
+
         # Fake
-        try:
-            pred_fake = self.netD(**{'x': self.fake.detach(), 'z': self.z.detach()})
-        except:
-            print('a')
+        # try:
+        # print(f"FAKE in backward_D_OCR_WL")
+        pred_fake = self.netD(**{'x': self.fake.detach(), 'z': self.z.detach()})
+        # except:
+        #     print('a')
+
         # Combined loss
-        self.loss_Dreal, self.loss_Dfake = loss_hinge_dis(pred_fake, pred_real, self.len_text_fake.detach(), self.len_text.detach(), self.opt.mask_loss)
+        self.loss_Dreal, self.loss_Dfake = loss_hinge_dis(pred_fake, pred_real, self.len_text_fake.detach(), self.len_text.detach(), mask_loss=True)
 
         self.loss_D = self.loss_Dreal + self.loss_Dfake
         # OCR loss on real data
         self.pred_real_OCR = self.netOCR(self.real.detach())
-        preds_size = torch.IntTensor([self.pred_real_OCR.size(0)] * self.opt.batch_size).detach()
+        preds_size = torch.IntTensor([self.pred_real_OCR.size(0)] * self.batch_size).detach()
         loss_OCR_real = self.OCR_criterion(self.pred_real_OCR, self.text_encode.detach(), preds_size, self.len_text.detach())
         self.loss_OCR_real = torch.mean(loss_OCR_real[~torch.isnan(loss_OCR_real)])
         # total loss
@@ -431,8 +387,6 @@ class TRGAN(nn.Module):
             param.grad[torch.isnan(param.grad)]=0
             param.grad[torch.isinf(param.grad)]=0
 
-
-
         return loss_total
 
     def optimize_D_WL_step(self):
@@ -444,7 +398,7 @@ class TRGAN(nn.Module):
     def backward_OCR(self):
         # OCR loss on real data
         self.pred_real_OCR = self.netOCR(self.real.detach())
-        preds_size = torch.IntTensor([self.pred_real_OCR.size(0)] * self.opt.batch_size).detach()
+        preds_size = torch.IntTensor([self.pred_real_OCR.size(0)] * self.batch_size).detach()
         loss_OCR_real = self.OCR_criterion(self.pred_real_OCR, self.text_encode.detach(), preds_size, self.len_text.detach())
         self.loss_OCR_real = torch.mean(loss_OCR_real[~torch.isnan(loss_OCR_real)])
 
@@ -457,34 +411,34 @@ class TRGAN(nn.Module):
 
         return self.loss_OCR_real
 
-
     def backward_D(self):
         # Real
-        if self.real_z_mean is None:
-            pred_real = self.netD(self.real.detach())
-        else:
-            pred_real = self.netD(**{'x': self.real.detach(), 'z': self.real_z_mean.detach()})
+        # print(f"REAL in backward_D")
+        pred_real = self.netD(**{'x': self.real.detach(), 'z': self.real_z_mean.detach()})
+
+        # print(f"FAKE in backward_D")
         pred_fake = self.netD(**{'x': self.fake.detach(), 'z': self.z.detach()})
+
         # Combined loss
-        self.loss_Dreal, self.loss_Dfake = loss_hinge_dis(pred_fake, pred_real, self.len_text_fake.detach(), self.len_text.detach(), self.opt.mask_loss)
+        self.loss_Dreal, self.loss_Dfake = loss_hinge_dis(pred_fake, pred_real, self.len_text_fake.detach(), self.len_text.detach(), mask_loss=True)
         self.loss_D = self.loss_Dreal + self.loss_Dfake
+
         # backward
         self.loss_D.backward()
 
-
         return self.loss_D
-
 
     def backward_G_only(self):
 
         self.gb_alpha = 0.7
         #self.Lcycle1 = self.Lcycle1.mean()
         #self.Lcycle2 = self.Lcycle2.mean()
+        # print(f"FAKE in backward_G_only")
         self.loss_G = loss_hinge_gen(self.netD(**{'x': self.fake}), self.len_text_fake.detach(), True).mean()
-
+        # print(f"OUT IN FAKE in backward_G_only")
 
         pred_fake_OCR = self.netOCR(self.fake)
-        preds_size = torch.IntTensor([pred_fake_OCR.size(0)] * batch_size).detach()
+        preds_size = torch.IntTensor([pred_fake_OCR.size(0)] * self.batch_size).detach()
         loss_OCR_fake = self.OCR_criterion(pred_fake_OCR, self.text_encode_fake.detach(), preds_size, self.len_text_fake.detach())
         self.loss_OCR_fake = torch.mean(loss_OCR_fake[~torch.isnan(loss_OCR_fake)])
 
@@ -512,10 +466,10 @@ class TRGAN(nn.Module):
         a = self.gb_alpha * torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_OCR))
 
 
-        if a is None:
-            print(self.loss_OCR_fake, self.loss_G, torch.std(grad_fake_adv), torch.std(grad_fake_OCR))
-        if a>1000 or a<0.0001:
-            print(a)
+        # if a is None:
+        #     print(self.loss_OCR_fake, self.loss_G, torch.std(grad_fake_adv), torch.std(grad_fake_OCR))
+        # if a>1000 or a<0.0001:
+        #     print(a)
 
 
         self.loss_OCR_fake = a.detach() * self.loss_OCR_fake
@@ -532,9 +486,9 @@ class TRGAN(nn.Module):
         with torch.no_grad():
             self.loss_T.backward()
 
-        if any(torch.isnan(loss_OCR_fake)) or torch.isnan(self.loss_G):
-            print('loss OCR fake: ', loss_OCR_fake, ' loss_G: ', self.loss_G, ' words: ', self.words)
-            sys.exit()
+        # if any(torch.isnan(loss_OCR_fake)) or torch.isnan(self.loss_G):
+        #     print('loss OCR fake: ', loss_OCR_fake, ' loss_G: ', self.loss_G, ' words: ', self.words)
+        #     sys.exit()
 
     def backward_G_WL(self):
 
@@ -542,9 +496,10 @@ class TRGAN(nn.Module):
         #self.Lcycle1 = self.Lcycle1.mean()
         #self.Lcycle2 = self.Lcycle2.mean()
 
-        self.loss_G = loss_hinge_gen(self.netD(**{'x': self.fake}), self.len_text_fake.detach(), True).mean()
+        # print("FAKE in backward_G_WL")
+        self.loss_G = loss_hinge_gen(self.netD(self.fake), self.len_text_fake.detach(), True).mean()
 
-        self.loss_w_fake = self.netW(self.fake, self.input['wcl'].to(DEVICE)).mean()
+        self.loss_w_fake = self.netW(self.fake, self.wcl).mean()
 
         self.loss_G = self.loss_G + self.Lcycle1 + self.Lcycle2 + self.lda1 + self.lda2 - self.KLD
 
@@ -560,12 +515,10 @@ class TRGAN(nn.Module):
 
         a = self.gb_alpha * torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_WL))
 
-
-
-        if a is None:
-            print(self.loss_w_fake, self.loss_G, torch.std(grad_fake_adv), torch.std(grad_fake_WL))
-        if a>1000 or a<0.0001:
-            print(a)
+        # if a is None:
+        #     print(self.loss_w_fake, self.loss_G, torch.std(grad_fake_adv), torch.std(grad_fake_WL))
+        # if a>1000 or a<0.0001:
+        #     print(a)
 
         self.loss_w_fake = a.detach() * self.loss_w_fake
 
@@ -581,15 +534,15 @@ class TRGAN(nn.Module):
             self.loss_T.backward()
 
     def backward_G(self):
-        self.opt.gb_alpha = 0.7
-        self.loss_G = loss_hinge_gen(self.netD(**{'x': self.fake, 'z': self.z}), self.len_text_fake.detach(), self.opt.mask_loss)
+        self.gb_alpha = 0.7
+        # print("FAKE IN backward_G")
+        self.loss_G = loss_hinge_gen(self.netD(self.fake), self.len_text_fake.detach(), mask_loss=True)
         # OCR loss on real data
 
         pred_fake_OCR = self.netOCR(self.fake)
-        preds_size = torch.IntTensor([pred_fake_OCR.size(0)] * self.opt.batch_size).detach()
+        preds_size = torch.IntTensor([pred_fake_OCR.size(0)] * self.batch_size).detach()
         loss_OCR_fake = self.OCR_criterion(pred_fake_OCR, self.text_encode_fake.detach(), preds_size, self.len_text_fake.detach())
         self.loss_OCR_fake = torch.mean(loss_OCR_fake[~torch.isnan(loss_OCR_fake)])
-
 
         self.loss_w_fake = self.netW(self.fake, self.wcl)
         #self.loss_OCR_fake = self.loss_OCR_fake + self.loss_w_fake
@@ -598,82 +551,68 @@ class TRGAN(nn.Module):
        # l1 = self.params[0]*self.loss_G
        # l2 = self.params[0]*self.loss_OCR_fake
         #l3 = self.params[0]*self.loss_w_fake
-        self.loss_G_ = 10*self.loss_G + self.loss_w_fake
+
+        self.loss_G_ = 10 * self.loss_G + self.loss_w_fake
         self.loss_T = self.loss_G_ + self.loss_OCR_fake
 
         grad_fake_OCR = torch.autograd.grad(self.loss_OCR_fake, self.fake, retain_graph=True)[0]
 
-
-        self.loss_grad_fake_OCR = 10**6*torch.mean(grad_fake_OCR**2)
+        self.loss_grad_fake_OCR = 10 ** 6 * torch.mean(grad_fake_OCR ** 2)
         grad_fake_adv = torch.autograd.grad(self.loss_G_, self.fake, retain_graph=True)[0]
-        self.loss_grad_fake_adv = 10**6*torch.mean(grad_fake_adv**2)
+        self.loss_grad_fake_adv = 10 ** 6*torch.mean(grad_fake_adv ** 2)
 
-        if not False:
+        self.loss_T.backward(retain_graph=True)
 
-            self.loss_T.backward(retain_graph=True)
-
-
-            grad_fake_OCR = torch.autograd.grad(self.loss_OCR_fake, self.fake, create_graph=True, retain_graph=True)[0]
-            grad_fake_adv = torch.autograd.grad(self.loss_G_, self.fake, create_graph=True, retain_graph=True)[0]
-            #grad_fake_wl = torch.autograd.grad(self.loss_w_fake, self.fake, create_graph=True, retain_graph=True)[0]
+        grad_fake_OCR = torch.autograd.grad(self.loss_OCR_fake, self.fake, create_graph=True, retain_graph=True)[0]
+        grad_fake_adv = torch.autograd.grad(self.loss_G_, self.fake, create_graph=True, retain_graph=True)[0]
+        #grad_fake_wl = torch.autograd.grad(self.loss_w_fake, self.fake, create_graph=True, retain_graph=True)[0]
 
 
-            a = self.opt.gb_alpha * torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_OCR))
+        a = self.gb_alpha * torch.div(torch.std(grad_fake_adv), self.epsilon + torch.std(grad_fake_OCR))
 
 
-            #a0 = self.opt.gb_alpha * torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_wl))
+        #a0 = self.gb_alpha * torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_wl))
 
-            if a is None:
-                print(self.loss_OCR_fake, self.loss_G_, torch.std(grad_fake_adv), torch.std(grad_fake_OCR))
-            if a>1000 or a<0.0001:
-                print(a)
-            b = self.opt.gb_alpha * (torch.mean(grad_fake_adv) -
-                                            torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_OCR))*
-                                            torch.mean(grad_fake_OCR))
-            # self.loss_OCR_fake = a.detach() * self.loss_OCR_fake + b.detach() * torch.sum(self.fake)
-            self.loss_OCR_fake = a.detach() * self.loss_OCR_fake
-            #self.loss_w_fake = a0.detach() * self.loss_w_fake
+        # if a is None:
+        #     print(self.loss_OCR_fake, self.loss_G_, torch.std(grad_fake_adv), torch.std(grad_fake_OCR))
+        # if a>1000 or a<0.0001:
+        #     print(a)
+        # b = self.gb_alpha * (torch.mean(grad_fake_adv) -
+        #                                 torch.div(torch.std(grad_fake_adv), self.epsilon+torch.std(grad_fake_OCR))*
+        #                                 torch.mean(grad_fake_OCR))
+        # self.loss_OCR_fake = a.detach() * self.loss_OCR_fake + b.detach() * torch.sum(self.fake)
+        self.loss_OCR_fake = a.detach() * self.loss_OCR_fake
+        #self.loss_w_fake = a0.detach() * self.loss_w_fake
 
-            self.loss_T = (1-1*self.opt.onlyOCR)*self.loss_G_ + self.loss_OCR_fake# + self.loss_w_fake
-            self.loss_T.backward(retain_graph=True)
-            grad_fake_OCR = torch.autograd.grad(self.loss_OCR_fake, self.fake, create_graph=False, retain_graph=True)[0]
-            grad_fake_adv = torch.autograd.grad(self.loss_G_, self.fake, create_graph=False, retain_graph=True)[0]
-            self.loss_grad_fake_OCR = 10 ** 6 * torch.mean(grad_fake_OCR ** 2)
-            self.loss_grad_fake_adv = 10 ** 6 * torch.mean(grad_fake_adv ** 2)
-            with torch.no_grad():
-                self.loss_T.backward()
-        else:
+        # loss weight
+        onlyOCR = 1
+        self.loss_T = (1 - onlyOCR) * self.loss_G_ + self.loss_OCR_fake # + self.loss_w_fake
+        self.loss_T.backward(retain_graph=True)
+
+        grad_fake_OCR = torch.autograd.grad(self.loss_OCR_fake, self.fake, create_graph=False, retain_graph=True)[0]
+        grad_fake_adv = torch.autograd.grad(self.loss_G_, self.fake, create_graph=False, retain_graph=True)[0]
+        self.loss_grad_fake_OCR = 10 ** 6 * torch.mean(grad_fake_OCR ** 2)
+        self.loss_grad_fake_adv = 10 ** 6 * torch.mean(grad_fake_adv ** 2)
+        with torch.no_grad():
             self.loss_T.backward()
 
-        if self.opt.clip_grad > 0:
-             clip_grad_norm_(self.netG.parameters(), self.opt.clip_grad)
-        if any(torch.isnan(loss_OCR_fake)) or torch.isnan(self.loss_G_):
-            print('loss OCR fake: ', loss_OCR_fake, ' loss_G: ', self.loss_G, ' words: ', self.words)
-            sys.exit()
+        # ???
+        # if self.opt.clip_grad > 0:
+        #      clip_grad_norm_(self.netG.parameters(), self.opt.clip_grad)
 
-
+        # if any(torch.isnan(loss_OCR_fake)) or torch.isnan(self.loss_G_):
+        #     print('loss OCR fake: ', loss_OCR_fake, ' loss_G: ', self.loss_G, ' words: ', self.words)
+        #     sys.exit()
 
     def optimize_D_OCR(self):
         self.forward()
         self.set_requires_grad([self.netD], True)
         self.set_requires_grad([self.netOCR], True)
         self.optimizer_D.zero_grad()
+
         #if self.opt.OCR_init in ['glorot', 'xavier', 'ortho', 'N02']:
         self.optimizer_OCR.zero_grad()
         self.backward_D_OCR()
-
-    def optimize_OCR(self):
-        self.forward()
-        self.set_requires_grad([self.netD], False)
-        self.set_requires_grad([self.netOCR], True)
-        if self.opt.OCR_init in ['glorot', 'xavier', 'ortho', 'N02']:
-            self.optimizer_OCR.zero_grad()
-        self.backward_OCR()
-
-    def optimize_D(self):
-        self.forward()
-        self.set_requires_grad([self.netD], True)
-        self.backward_D()
 
     def optimize_D_OCR_step(self):
         self.optimizer_D.step()
@@ -682,48 +621,12 @@ class TRGAN(nn.Module):
         self.optimizer_D.zero_grad()
         self.optimizer_OCR.zero_grad()
 
-
-    def optimize_D_OCR_WL(self):
-        self.forward()
-        self.set_requires_grad([self.netD], True)
-        self.set_requires_grad([self.netOCR], True)
-        self.set_requires_grad([self.netW], True)
-        self.optimizer_D.zero_grad()
-        self.optimizer_wl.zero_grad()
-        if self.opt.OCR_init in ['glorot', 'xavier', 'ortho', 'N02']:
-            self.optimizer_OCR.zero_grad()
-        self.backward_D_OCR_WL()
-
-    def optimize_D_OCR_WL_step(self):
-        self.optimizer_D.step()
-        if self.opt.OCR_init in ['glorot', 'xavier', 'ortho', 'N02']:
-            self.optimizer_OCR.step()
-        self.optimizer_wl.step()
-        self.optimizer_D.zero_grad()
-        self.optimizer_OCR.zero_grad()
-        self.optimizer_wl.zero_grad()
-
-    def optimize_D_step(self):
-        self.optimizer_D.step()
-        if any(torch.isnan(self.netD.infer_img.blocks[0][0].conv1.bias)):
-            print('D is nan')
-            sys.exit()
-        self.optimizer_D.zero_grad()
-
-    def optimize_G(self):
-        self.forward()
-        self.set_requires_grad([self.netD], False)
-        self.set_requires_grad([self.netOCR], False)
-        self.set_requires_grad([self.netW], False)
-        self.backward_G()
-
     def optimize_G_WL(self):
         self.forward()
         self.set_requires_grad([self.netD], False)
         self.set_requires_grad([self.netOCR], False)
         self.set_requires_grad([self.netW], False)
         self.backward_G_WL()
-
 
     def optimize_G_only(self):
         self.forward()
@@ -732,111 +635,6 @@ class TRGAN(nn.Module):
         self.set_requires_grad([self.netW], False)
         self.backward_G_only()
 
-
     def optimize_G_step(self):
-
         self.optimizer_G.step()
         self.optimizer_G.zero_grad()
-
-    def optimize_ocr(self):
-        self.set_requires_grad([self.netOCR], True)
-        # OCR loss on real data
-        pred_real_OCR = self.netOCR(self.real)
-        preds_size =torch.IntTensor([pred_real_OCR.size(0)] * self.opt.batch_size).detach()
-        self.loss_OCR_real = self.OCR_criterion(pred_real_OCR, self.text_encode.detach(), preds_size, self.len_text.detach())
-        self.loss_OCR_real.backward()
-        self.optimizer_OCR.step()
-
-    def optimize_z(self):
-        self.set_requires_grad([self.z], True)
-
-
-    def optimize_parameters(self):
-        self.forward()
-        self.set_requires_grad([self.netD], False)
-        self.optimizer_G.zero_grad()
-        self.backward_G()
-        self.optimizer_G.step()
-
-        self.set_requires_grad([self.netD], True)
-        self.optimizer_D.zero_grad()
-        self.backward_D()
-        self.optimizer_D.step()
-
-    def test(self):
-        self.visual_names = ['fake']
-        self.netG.eval()
-        with torch.no_grad():
-            self.forward()
-
-    def train_GD(self):
-        self.netG.train()
-        self.netD.train()
-        self.optimizer_G.zero_grad()
-        self.optimizer_D.zero_grad()
-        # How many chunks to split x and y into?
-        x = torch.split(self.real, self.opt.batch_size)
-        y = torch.split(self.label, self.opt.batch_size)
-        counter = 0
-
-        # Optionally toggle D and G's "require_grad"
-        if self.opt.toggle_grads:
-            toggle_grad(self.netD, True)
-            toggle_grad(self.netG, False)
-
-        for step_index in range(self.opt.num_critic_train):
-            self.optimizer_D.zero_grad()
-            with torch.set_grad_enabled(False):
-                self.forward()
-            D_input = torch.cat([self.fake, x[counter]], 0) if x is not None else self.fake
-            D_class = torch.cat([self.label_fake, y[counter]], 0) if y[counter] is not None else y[counter]
-            # Get Discriminator output
-            D_out = self.netD(D_input, D_class)
-            if x is not None:
-                pred_fake, pred_real = torch.split(D_out, [self.fake.shape[0], x[counter].shape[0]])  # D_fake, D_real
-            else:
-                pred_fake = D_out
-            # Combined loss
-            self.loss_Dreal, self.loss_Dfake = loss_hinge_dis(pred_fake, pred_real, self.len_text_fake.detach(), self.len_text.detach(), self.opt.mask_loss)
-            self.loss_D = self.loss_Dreal + self.loss_Dfake
-            self.loss_D.backward()
-            counter += 1
-            self.optimizer_D.step()
-
-        # Optionally toggle D and G's "require_grad"
-        if self.opt.toggle_grads:
-            toggle_grad(self.netD, False)
-            toggle_grad(self.netG, True)
-        # Zero G's gradients by default before training G, for safety
-        self.optimizer_G.zero_grad()
-        self.forward()
-        self.loss_G = loss_hinge_gen(self.netD(self.fake, self.label_fake), self.len_text_fake.detach(), self.opt.mask_loss)
-        self.loss_G.backward()
-        self.optimizer_G.step()
-
-
-
-
-
-    def save_networks(self, epoch, save_dir):
-        """Save all the networks to the disk.
-        Parameters:
-            epoch (int) -- current epoch; used in the file name '%s_net_%s.pth' % (epoch, name)
-        """
-        for name in self.model_names:
-            if isinstance(name, str):
-                save_filename = '%s_net_%s.pth' % (epoch, name)
-                save_path = os.path.join(save_dir, save_filename)
-                net = getattr(self, 'net' + name)
-
-                if len(self.gpu_ids) > 0 and torch.cuda.is_available():
-                    # torch.save(net.module.cpu().state_dict(), save_path)
-                    if len(self.gpu_ids) > 1:
-                        torch.save(net.module.cpu().state_dict(), save_path)
-                    else:
-                        torch.save(net.cpu().state_dict(), save_path)
-                    net.cuda(self.gpu_ids[0])
-                else:
-                    torch.save(net.cpu().state_dict(), save_path)
-
-

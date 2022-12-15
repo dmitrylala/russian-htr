@@ -11,8 +11,6 @@ from .base import BaseTaskWithCustomConstructor
 
 @TASKS.register_class
 class TextToImageTask(BaseTaskWithCustomConstructor):
-    """A class for text to image generation task."""
-
     def __init__(
             self,
             hparams: DictConfig,
@@ -29,19 +27,11 @@ class TextToImageTask(BaseTaskWithCustomConstructor):
         """Init ClassificationTask.
         Args:
             hparams: Hyperparameters that set in yaml file.
-            backbone_name: name of the backbone architecture in the BACKBONES registry.
-            pooling_name: name of the backbone architecture in the POOLINGS registry.
-            head_name: name of the neck architecture in the HEADS registry.
-            neck_name: if present, name of the head architecture in the NECKS registry. Otherwise, model will be created
-                without neck.
-            backbone_params: parameters for backbone constructor.
-            neck_params: parameters for neck constructor. `in_channels` will be set automatically based on backbone.
-            pooling_params: parameters for neck constructor. `in_channels` will be set automatically based on neck or
-                backbone if neck is absent.
-            head_params: parameters for head constructor. `in_channels` will be set automatically based on neck.
+            TODO: params
             inputs: information about input model shapes and dtypes.
         """
         super().__init__(hparams, **kwargs)
+
         # BACKBONE
         backbones_params = backbone_params or dict()
         self.backbone = BACKBONES.get(backbone_name)(**backbones_params)
